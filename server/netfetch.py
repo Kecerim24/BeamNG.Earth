@@ -237,6 +237,11 @@ POLICIES = {
     "nvdbapiles.atlas.vegvesen.no": HostPolicy(rate=2.0, burst=4.0, max_conc=2, daily_budget=3000, daily_hard=6000,
                                                allow_prefetch=True, offline_ok=True, miss_ttl=None, timeout=30.0,
                                                max_attempts=3, base_delay=2.0, optional=True),
+    # ČÚZK's open data downloads (roadz.py "cz": the Czech bridge decks, BNE_CZ_DECKS): DMP 1G map sheets, a zipped LAZ
+    # of ~8 MB each, those a cell's bridges cross once (the decks made from them are kept); optional (the inference)
+    "openzu.cuzk.cz": HostPolicy(rate=1.0, burst=4.0, max_conc=2, daily_budget=1500, daily_hard=3000,
+                                 allow_prefetch=True, offline_ok=True, miss_ttl=None, binary=True, timeout=90.0,
+                                 max_attempts=2, base_delay=2.0, optional=True),
     # never at runtime (OSM Overpass, OSMF vector tiles, Protomaps builds): §3.3
     "overpass-api.de": HostPolicy(denied=True, daily_hard=0),
     "vector.openstreetmap.org": HostPolicy(denied=True, daily_hard=0),
@@ -295,6 +300,7 @@ ROLES = {
     "data.openstreetmap.us": "road details from OpenStreetMap (lanes, widths, sidewalks); estimated meanwhile",
     "s3-us-west-2.amazonaws.com": "US lidar for bridge deck heights; estimated meanwhile",
     "nvdbapiles.atlas.vegvesen.no": "Norway's measured road, bridge and tunnel heights; estimated meanwhile",
+    "openzu.cuzk.cz": "Czech lidar for bridge deck heights; estimated meanwhile",
     "tecnagamer.github.io": "railway details, US railroad crossing equipment and lane markings; estimated meanwhile",
     "api.open-meteo.com": "live weather; the weather stays as it is meanwhile",
     "downloads.sourceforge.net": "the gravity model; standard gravity meanwhile",

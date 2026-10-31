@@ -18,13 +18,19 @@ Sources, each per z14 map-data cell, kept on disk under <cache>/roadz/v<VERSION>
   end that the lidar shows elevated (roads.lidar_gap_candidates: an untagged viaduct stretch), read where the
   deck's measured end stands over the DTM only (the nodes the decks' read had not): their elevated start is a deck
   in roads.level_ranges (gap_answers, one decision per cell and server run; BNE_LIDAR_GAPS=off: none).
+- "cz": the Czech Republic, ČÚZK's DMP 1G (the digital surface model of 2009-2013 airborne lidar, CC BY 4.0): the same
+  deck measurement as "lidar" from the LAZ map sheets (2.5 x 2 km of S-JTSK, ~8 MB, ~0.5 points a m2; ground, class
+  2, and everything on it, 5 / 6: a deck is 6) the cell's bridges cross, read whole (no octree); the S-JTSK points
+  brought to WGS84 by sjtsk.inverse, the heights (Bpv) onto our DEM's by its ground points like the US lidar. Bridges
+  built since keep the inference (no surface along them: too few stations measured). Decks only (no ground stretches).
 Matching (earthfast.roadz_match): each station of a map road takes the nearest source segment of its level (bridge,
 tunnel, ground) within reach whose direction agrees and whose name / number does not contradict the map's; the
 heights then lose their spikes and impossible grades (earthfast.profile_clean). Vector heights are taken relative to
 the source's own ground: the median of (source Z - our DEM) over its ground roads near the part (else the cell's) is
 taken off, so a datum or survey offset of 0.5-2 m makes no step where the deck meets our graded approach.
 
-Off: BNE_ROADZ=off (every source), BNE_LIDAR_DECKS=off (the US lidar decks only). Pure given the cached data: every
+Off: BNE_ROADZ=off (every source), BNE_LIDAR_DECKS=off (the US lidar decks only), BNE_CZ_DECKS=off (the Czech decks
+only). Pure given the cached data: every
 process reads the same files; a fetch that fails is a revisit fault (netfetch) and the inference stands in.
 """
 import gzip
@@ -50,11 +56,14 @@ NATIVE = 102                # earthfast.VERSION of the kernels below
 ON = os.environ.get("BNE_ROADZ", "on") != "off"
 LIDAR_ON = os.environ.get("BNE_LIDAR_DECKS", "on") != "off"
 LIDAR_INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usgs3dep_index.json.gz")
+CZ_ON = os.environ.get("BNE_CZ_DECKS", "on") != "off"
+CZ_INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuzk_dmp1g_index.json.gz")
 PROVIDER = None             # the server's RoadZ (MapData makes it): BridgeProfiles / Grader ask it
 
 FR_BOUNDS = (41.3, -5.2, 51.2, 9.7)         # lat0, lon0, lat1, lon1: metropolitan France (PR #456's box)
 NO_BOUNDS = (57.9, 4.0, 71.3, 31.3)         # mainland Norway
 US_BOUNDS = ((24.0, -125.0, 49.5, -66.5), (51.0, -170.0, 71.5, -129.0), (18.5, -161.0, 22.5, -154.5))
+CZ_BOUNDS = (48.5, 12.0, 51.1, 18.9)        # the Czech Republic (its sheets: cz_sheet_at)
 WFS_URL = "https://data.geopf.fr/wfs/ows"
 WFS_LANE = "ign_wfs"
 WFS_PAGE = 1000
@@ -79,6 +88,9 @@ MASK_M = 8.0                # m, the cells of the boxes' mask the points are kep
 DATUM_MIN_PTS = 50
 DATUM_MAX_MAD_M = 2.0       # the dataset's ground off ours by more than this (spread): not used there
 CLIP_PAD_M = 60.0           # m past a cell's box its bridges are measured (the next cell measures on)
+CZ_SHEETS_MAX = 6           # DMP 1G sheets a cell reads at most (~50 MB)
+CZ_MEM_SHEETS = 4           # sheets kept in memory (a cell's neighbours read the same ones)
+DECK_SOURCES = ("lidar", "cz")      # measured along the map's own bridge lines, on our DEM's datum already
 
 # NVDB flags few bridges on its road links (medium "L"; most bridges are objects of their own, type 60), but its links'
 # heights are the road's own, on a deck too: a map bridge may take any link of it that is not in a tunnel (the
@@ -119,10 +131,11 @@ def _in(b, lat, lon):
     return b[0] <= lat <= b[2] and b[1] <= lon <= b[3]
 
 
-def sources_at(lat, lon, lidar=None):
-    """The sources that may know heights at (lat, lon): 'ign', 'nvdb', 'lidar' (bridges only; lidar: on, default
-    LIDAR_ON)."""
+def sources_at(lat, lon, lidar=None, cz=None):
+    """The sources that may know heights at (lat, lon): 'ign', 'nvdb', 'lidar', 'cz' (bridges only; lidar / cz: on,
+    default LIDAR_ON / CZ_ON)."""
     lidar = LIDAR_ON if lidar is None else lidar
+    cz = CZ_ON if cz is None else cz
     out = []
     if _in(FR_BOUNDS, lat, lon):
         out.append("ign")
@@ -130,6 +143,8 @@ def sources_at(lat, lon, lidar=None):
         out.append("nvdb")
     if lidar and any(_in(b, lat, lon) for b in US_BOUNDS):
         out.append("lidar")
+    if cz and _in(CZ_BOUNDS, lat, lon) and cz_sheet_at(lat, lon) is not None:
+        out.append("cz")
     return out
 
 
@@ -322,6 +337,46 @@ def lidar_datasets(lat, lon):
     return [d["n"] for d in hits]
 
 
+# ---- the Czech DMP 1G ----------------------------------------------------------------------------------------------
+
+_cz_index = None
+
+
+def _cz_sheets():
+    """The DMP 1G index (tools/build_cz_dmp_index.py): {"sheet": [w, h], "url": ..., "tiles": {"col,row": name}}."""
+    global _cz_index
+    with _index_lock:
+        if _cz_index is None:
+            try:
+                with gzip.open(CZ_INDEX_PATH, "rt", encoding="utf-8") as fh:
+                    _cz_index = json.load(fh)
+            except Exception as e:
+                log.warning("DMP 1G index %s: %s", CZ_INDEX_PATH, e)
+                _cz_index = {"sheet": [2500.0, 2000.0], "url": "", "tiles": {}}
+    return _cz_index
+
+
+def cz_sheets_in(x0, y0, x1, y1):
+    """The DMP 1G sheet names overlapping the S-JTSK box (x0, y0, x1, y1), sorted (the cells without one left out)."""
+    d = _cz_sheets()
+    w, h = d["sheet"]
+    out = set()
+    for c in range(int(x0 // w), int(x1 // w) + 1):
+        for r in range(int(y0 // h), int(y1 // h) + 1):
+            n = d["tiles"].get(f"{c},{r}")
+            if n:
+                out.add(n)
+    return sorted(out)
+
+
+def cz_sheet_at(lat, lon):
+    """The DMP 1G sheet name at (lat, lon), None: none."""
+    import sjtsk
+    x, y = sjtsk.forward(lat, lon)
+    got = cz_sheets_in(float(x), float(y), float(x), float(y))
+    return got[0] if got else None
+
+
 def resample_line(xy, step):
     """(points (m, 2), arc (m,)) every ~step m along polyline xy, ending on both ends."""
     xy = np.asarray(xy, np.float64)[:, :2]
@@ -438,11 +493,13 @@ class RoadZ:
         self._off = {}                      # (source, cell) -> the cell's datum offset (None: none)
         self._names = {}                    # (source, cell, map name) -> name_ok per line
         self._ept = {}                      # dataset name -> Ept
+        self._cz_mem = OrderedDict()        # DMP 1G sheet name -> its LAZ bytes (CZ_MEM_SHEETS)
         self._lock = threading.Lock()
         self._cell_locks = {}
         self.stats = {"cells": 0, "requests": 0, "bytes": 0, "seconds": 0.0}     # (built here, not read from disk)
         self.enabled = ON                   # (the probes measure with it on whatever BNE_ROADZ says)
         self.lidar = LIDAR_ON
+        self.cz = CZ_ON
 
     # ---- cells ----
     def _path(self, src, key):
@@ -480,7 +537,7 @@ class RoadZ:
             if got is None:
                 t0 = time.monotonic()
                 try:
-                    got = {"ign": self._ign, "nvdb": self._nvdb, "lidar": self._lidar}[src](key)
+                    got = {"ign": self._ign, "nvdb": self._nvdb, "lidar": self._lidar, "cz": self._cz}[src](key)
                 except Exception as e:      # (a FetchError is a revisit fault already)
                     log.debug("roadz %s %s: %s: %s", src, key, type(e).__name__, e)
                     import revisit
@@ -525,7 +582,7 @@ class RoadZ:
         def run():
             for k in keys:
                 la, lo = k.center()
-                for src in sources_at(la, lo, self.lidar):
+                for src in sources_at(la, lo, self.lidar, self.cz):
                     try:
                         self.lines(src, k)
                     except Exception as e:      # (the road processes ask again)
@@ -672,9 +729,9 @@ class RoadZ:
                               float(ys.max()) + pad))
         return boxes
 
-    def _read(self, name, nodes, boxes):
+    def _read(self, name, nodes, boxes, get=None):
         """(xyz (n, 3) Mercator / the dataset's heights, class (n,)) of the EPT nodes' points in boxes, LIDAR_FETCH_THREADS
-        reads at once, in node order."""
+        reads at once, in node order. get: node -> its LAS / LAZ bytes instead (the boxes then in its file's CRS)."""
         bb = [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)]
         # the boxes as a grid of MASK_M cells (the points kept: those in a box's cells)
         nx = int(math.ceil((bb[2] - bb[0]) / MASK_M)) + 1
@@ -685,7 +742,7 @@ class RoadZ:
                  int((b[0] - bb[0]) // MASK_M):int((b[2] - bb[0]) // MASK_M) + 1] = True
 
         def read(k):
-            p, c = fast._ef.las_decode(self._fetch(f"{EPT_BASE}{name}/ept-data/{k}.laz"), bb)
+            p, c = fast._ef.las_decode(get(k) if get else self._fetch(f"{EPT_BASE}{name}/ept-data/{k}.laz"), bb)
             if not len(p):
                 return p, c
             keep = mask[((p[:, 1] - bb[1]) // MASK_M).astype(int).clip(0, ny - 1),
@@ -767,6 +824,81 @@ class RoadZ:
         got = Lines.build(rows, corrected=True)
         got.gaps = gaps
         return got
+
+    def _cz_sheet(self, name):
+        """The LAZ bytes of DMP 1G sheet name (its zip's one file), the last CZ_MEM_SHEETS kept in memory."""
+        with self._lock:
+            got = self._cz_mem.get(name)
+            if got is not None:
+                self._cz_mem.move_to_end(name)
+                return got
+            lock = self._cell_locks.setdefault(("czsheet", name), threading.Lock())
+        with lock:                          # (a cell's neighbours read the same sheets meanwhile)
+            with self._lock:
+                got = self._cz_mem.get(name)
+            if got is not None:
+                return got
+            import io
+            import zipfile
+            body = self._fetch(_cz_sheets()["url"].format(name=name))
+            with zipfile.ZipFile(io.BytesIO(body)) as z:
+                member = next(n for n in z.namelist() if n.lower().endswith((".laz", ".las")))
+                got = z.read(member)
+            with self._lock:
+                self._cz_mem[name] = got
+                while len(self._cz_mem) > CZ_MEM_SHEETS:
+                    self._cz_mem.popitem(last=False)
+            return got
+
+    def _cz(self, key):
+        """The cell's decks measured in the DMP 1G sheets its bridges cross (an empty Lines: none, too many sheets or
+        no datum fit; the inference stands)."""
+        import geodesy
+        import sjtsk
+        parts = self._bridges(key)
+        if not parts:
+            return Lines.build([], corrected=True)
+        lat_c, lon_c = key.center()
+        frame = geodesy.EnuFrame(lat_c, lon_c)
+        local, boxes = [], []
+        for ring, half in parts:
+            e, n, _ = frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
+            xy = np.stack([np.asarray(e), np.asarray(n)], 1)
+            local.append((xy, half))
+            # (a box per BOX_STEP_M of the line, in S-JTSK: the sheets' CRS)
+            pts_, _ = resample_line(xy, BOX_STEP_M)
+            la_, lo_, _ = frame.enu_to_geodetic(pts_[:, 0], pts_[:, 1], 0.0)
+            x, y = sjtsk.forward(np.asarray(la_), np.asarray(lo_))
+            pad = half + LIDAR_PAD_M + 2.0
+            for j in range(max(1, len(x) - 1)):
+                xs, ys = x[j:j + 2], y[j:j + 2]
+                boxes.append((float(xs.min()) - pad, float(ys.min()) - pad, float(xs.max()) + pad,
+                              float(ys.max()) + pad))
+        names = sorted(set().union(*(cz_sheets_in(*b) for b in boxes)))     # (the boxes' own: not their whole bbox's)
+        if not names:
+            return Lines.build([], corrected=True)
+        if len(names) > CZ_SHEETS_MAX:
+            log.debug("roadz cz %s: %d sheets, over %d", key, len(names), CZ_SHEETS_MAX)
+            return Lines.build([], corrected=True)
+        fast.require(NATIVE, "roadz cz decks")
+        xyz, cls = self._read(None, names, boxes, get=self._cz_sheet)
+        if not len(xyz):
+            return Lines.build([], corrected=True)
+        la, lo = sjtsk.inverse(xyz[:, 0], xyz[:, 1])
+        gi = np.flatnonzero(cls == 2)
+        if len(gi) > 4000:
+            gi = gi[:: int(math.ceil(len(gi) / 4000))]
+        fit = datum_fit(xyz[gi, 2], self._dem_raw(la[gi], lo[gi])) if len(gi) else None
+        if fit is None:
+            log.debug("roadz cz %s: no datum fit (%d ground points)", key, len(gi))
+            return Lines.build([], corrected=True)
+        scale, off = fit
+        e, n, _ = frame.geodetic_to_enu(la, lo, 0.0)
+        pts = np.ascontiguousarray(np.stack([np.asarray(e), np.asarray(n), xyz[:, 2] * scale - off], 1))
+        rows, _ends = self._decks(frame, parts, local, pts, np.ascontiguousarray(cls, np.uint8))
+        log.debug("roadz cz %s: %d sheets, %d points, %d of %d decks, datum %.3f x - %.2f", key, len(names), len(pts),
+                  len(rows), len(parts), scale, off)
+        return Lines.build(rows, corrected=True)
 
     @staticmethod
     def _profile(frame, xy, half, pts, cls):
@@ -1014,7 +1146,8 @@ class RoadZ:
         la, lo, _ = frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
         la, lo = np.asarray(la, np.float64), np.asarray(lo, np.float64)
         mid = len(xy) // 2
-        srcs = [s for s in sources_at(float(la[mid]), float(lo[mid]), self.lidar) if s != "lidar" or level > 0]
+        srcs = [s for s in sources_at(float(la[mid]), float(lo[mid]), self.lidar, self.cz)
+                if s not in DECK_SOURCES or level > 0]
         if not srcs:
             return None
         pad = (half + MATCH_REACH_M) / 111320.0
@@ -1044,14 +1177,14 @@ class RoadZ:
                 cells.append((k, ln, vxy))
             if not segs:
                 continue
-            reach = half + (LIDAR_REACH_M if src == "lidar" else MATCH_REACH_M)
+            reach = half + (LIDAR_REACH_M if src in DECK_SOURCES else MATCH_REACH_M)
             z, dist = fast._ef.roadz_match(np.ascontiguousarray(xy), qdir, np.ascontiguousarray(np.vstack(segs)),
                                            np.ascontiguousarray(np.vstack(segz)),
                                            np.ascontiguousarray(np.concatenate(oks)), float(reach), MATCH_COS)
             if not np.isfinite(z).any():
                 continue
             off = 0.0
-            if src != "lidar":
+            if src not in DECK_SOURCES:
                 off = self._local_offset(src, cells, xy, frame)
                 if off is None:
                     continue

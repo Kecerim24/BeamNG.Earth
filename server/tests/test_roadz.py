@@ -221,7 +221,7 @@ def provider_with(lines, src="ign", dem=FLAT):
 class ObservedTest(unittest.TestCase):
     def setUp(self):
         self.old = roadz.sources_at
-        roadz.sources_at = lambda lat, lon, lidar=None: ["ign"]
+        roadz.sources_at = lambda lat, lon, lidar=None, cz=None: ["ign"]
 
     def tearDown(self):
         roadz.sources_at = self.old
@@ -424,6 +424,79 @@ class MeasuredRampFromPlanTest(unittest.TestCase):
     def test_ramp_from_the_plan(self):
         self.assertLess(abs(self.lifted(FLAT + 0.2) - FLAT), 0.05, "measured at the street's height: not raised")
         self.assertAlmostEqual(self.lifted(FLAT + 2.0), FLAT + 2.0, delta=0.05, msg="raised to the deck's end")
+
+
+def las_bytes(xyz, cls):
+    """A LAS 1.2 point format 0 file (no compression) of points xyz (n, 3), classes cls (n,): 1 cm steps."""
+    xyz = np.asarray(xyz, np.float64)
+    off = np.floor(xyz.min(0))
+    hdr = bytearray(227)
+    hdr[0:4] = b"LASF"
+    hdr[24], hdr[25] = 1, 2
+    struct.pack_into("<H", hdr, 94, 227)
+    struct.pack_into("<I", hdr, 96, 227)
+    struct.pack_into("<H", hdr, 105, 20)
+    struct.pack_into("<I", hdr, 107, len(xyz))
+    struct.pack_into("<3d", hdr, 131, 0.01, 0.01, 0.01)
+    struct.pack_into("<3d", hdr, 155, *off)
+    rec = np.zeros(len(xyz), np.dtype([("xyz", "<i4", 3), ("i", "<u2"), ("f", "u1"), ("c", "u1"), ("pad", "V4")]))
+    rec["xyz"] = np.round((xyz - off) / 0.01).astype(np.int32)
+    rec["c"] = cls
+    return bytes(hdr) + rec.tobytes()
+
+
+class CzSheetTest(unittest.TestCase):
+    def test_sheet_at(self):
+        self.assertEqual(roadz.cz_sheet_at(50.0656, 14.4303), "PRAH62", "the Nusle bridge (its west edge: PRAH72)")
+        self.assertIn("cz", roadz.sources_at(50.0656, 14.4303, cz=True))
+        self.assertNotIn("cz", roadz.sources_at(50.0656, 14.4303, cz=False))
+        self.assertNotIn("cz", roadz.sources_at(51.05, 13.74, cz=True), "Dresden: in the box, on no sheet")
+        self.assertNotIn("cz", roadz.sources_at(48.2, 16.37, cz=True), "Vienna")
+
+    def test_sheets_in(self):
+        self.assertEqual(roadz.cz_sheets_in(-742510.0, -1045000.0, -742490.0, -1045000.0), ["PRAH62", "PRAH72"])
+
+
+@unittest.skipUnless(NATIVE, "earthfast roadz kernels")
+class CzDeckTest(unittest.TestCase):
+    """roadz "cz": a deck measured in a (synthetic) DMP 1G sheet, its Bpv heights brought onto our DEM's."""
+
+    def test_deck(self):
+        import io
+        import sjtsk
+        import zipfile
+        rng = np.random.default_rng(5)
+        # a 200 m bridge inside sheet PRAH62 (S-JTSK x -742500..-740000, y -1046000..-1044000), going north; the
+        # ground at 200.3 (Bpv; our DEM: 200.0), the deck 20 m over it rising 1 %, ~0.5 points a m2 like DMP 1G
+        x0, y0 = -741300.0, -1045100.0
+        gx, gy = rng.uniform(x0 - 40, x0 + 40, 3200), rng.uniform(y0 - 20, y0 + 220, 3200)
+        dy = rng.uniform(0, 200, 800)
+        dx = x0 + rng.uniform(-5, 5, 800)
+        pts = np.vstack([np.c_[gx, gy, np.full(len(gx), 200.3)], np.c_[dx, y0 + dy, 220.3 + 0.01 * dy]])
+        cls = np.r_[np.full(len(gx), 2), np.full(len(dx), 6)].astype(np.uint8)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("PRAH62.laz", las_bytes(pts, cls))
+        got = []
+
+        class Fetcher:
+            def get(self, url, **kw):
+                got.append(url)
+                return type("R", (), {"body": buf.getvalue()})()
+
+        la, lo = sjtsk.inverse(np.full(9, x0), np.linspace(y0, y0 + 200, 9))
+        rz = roadz.RoadZ(None, Fetcher(), FakeMDem(200.0))
+        rz._bridges = lambda key: [(np.c_[lo, la], 5.0)]
+        key = mapcells.cells_for_points(la[4:5], lo[4:5], 0, 0)[0]
+        ln = rz._cz(key)
+        self.assertEqual(got, ["https://openzu.cuzk.cz/opendata/DMP1G/epsg-5514/PRAH62.zip"])
+        self.assertEqual(len(ln), 1)
+        z = ln.z[np.isfinite(ln.z)]
+        self.assertGreater(len(z), 40)
+        self.assertAlmostEqual(float(z.min()), 220.0, delta=0.3, msg="the deck less the datum offset (0.3)")
+        self.assertAlmostEqual(float(z.max()), 222.0, delta=0.3)
+        self.assertEqual(len(rz._cz(key)), 1)
+        self.assertEqual(len(got), 1, "the sheet read once")
 
 
 if __name__ == "__main__":
